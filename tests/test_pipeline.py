@@ -36,7 +36,22 @@ def make_snapshot(
     fees: list[RewardAmount],
     incentives: list[RewardAmount],
     reserves_usd: dict | None = None,
+    emissions_raw: int = 0,
+    pool_fee: float = 0.003,
 ) -> PoolSnapshot:
+    # Build a synthetic `reserves` list from the {addr: usd} input so existing
+    # test bodies stay terse. Each side stored at price=1.0 with the dollar
+    # value as the amount — round-trips through the strong-paired logic.
+    reserves: list[RewardAmount] = []
+    for addr, usd in (reserves_usd or {}).items():
+        reserves.append(RewardAmount(
+            token_address=addr,
+            symbol="",
+            decimals=6,
+            amount_raw=int(round(usd * 10**6)),
+            usd_per_token=1.0,
+            listed=False,
+        ))
     return PoolSnapshot(
         pool_address=address,
         symbol=symbol,
@@ -46,7 +61,9 @@ def make_snapshot(
         votes_raw=int(votes_veaero * 1e18),
         fees=fees,
         incentives=incentives,
-        reserves_usd_by_token=reserves_usd or {},
+        reserves=reserves,
+        emissions_raw=emissions_raw,
+        pool_fee=pool_fee,
     )
 
 
@@ -289,6 +306,123 @@ def test_snapshot_store_roundtrip(tmp_path):
         # Same captured_at + pool should replace (primary key collision).
         write_snapshots(conn, [s], captured_at=1_700_003_600)
         assert row_count(conn) == 2
+
+
+def test_snapshot_persists_every_field_we_need(tmp_path):
+    """Lossless round-trip: every field needed for V4 backtest + dilution training
+    survives write → read. If this test breaks in a way that drops a column,
+    re-collecting historical data is impossible — fix forward, never silently."""
+    import json, sqlite3
+    from avro.snapshot import open_db, write_snapshots, decode_amounts
+    from avro.sugar import PoolSnapshot, RewardAmount
+
+    # A pool with every field populated, including realistic uint256-scale votes.
+    huge_votes = 12_459_691_003_605_000_454_982_973  # > 2^63, force TEXT storage
+    s = PoolSnapshot(
+        pool_address="0xPOOL",
+        symbol="USDC/STAR",
+        is_cl=True,
+        is_stable=False,
+        epoch_ts=1_778_716_800,
+        votes_raw=huge_votes,
+        fees=[RewardAmount(USDC, "USDC", 6, 5_000_000, 1.0, listed=True)],
+        incentives=[RewardAmount(RANDO, "STAR", 18, 10**20, 0.0123, listed=False)],
+        reserves=[
+            RewardAmount(USDC, "USDC", 6, 100_000_000_000, 1.0, listed=True),
+            RewardAmount(RANDO, "STAR", 18, 5 * 10**21, 0.0123, listed=False),
+        ],
+        emissions_raw=42 * 10**18,
+        pool_fee=0.003,
+    )
+
+    db = tmp_path / "snap.sqlite"
+    with open_db(db) as conn:
+        write_snapshots(conn, [s], captured_at=1_700_000_000)
+        row = conn.execute(
+            "SELECT captured_at, epoch_ts, pool_address, symbol, is_cl, is_stable, "
+            "votes_raw, gross_reward_usd, fees_json, incentives_json, "
+            "reserves_json, emissions_raw, pool_fee FROM pool_epoch_snapshots"
+        ).fetchone()
+
+    (ca, ep, addr, sym, cl, stab, votes_text, gross, fees_j, inc_j,
+     res_j, em_text, pfee) = row
+
+    assert ca == 1_700_000_000
+    assert ep == 1_778_716_800
+    assert addr == "0xpool"  # written lowercased
+    assert sym == "USDC/STAR"
+    assert cl == 1 and stab == 0
+    # uint256 vote count survives — this is the whole reason votes_raw is TEXT.
+    assert int(votes_text) == huge_votes
+    assert int(em_text) == 42 * 10**18
+    assert pfee == 0.003
+    # Reserves and listed flag are now persisted.
+    fees = decode_amounts(fees_j)
+    incs = decode_amounts(inc_j)
+    res = decode_amounts(res_j)
+    assert len(fees) == 1 and fees[0].listed is True
+    assert len(incs) == 1 and incs[0].listed is False
+    assert len(res) == 2
+    assert {r.symbol for r in res} == {"USDC", "STAR"}
+    assert res[0].amount_raw == 100_000_000_000
+    assert res[1].amount_raw == 5 * 10**21
+    # Gross USD is summed correctly (and round-trips via SQLite REAL).
+    expected_gross = (
+        (5_000_000 / 10**6) * 1.0
+        + (10**20 / 10**18) * 0.0123
+    )
+    assert math.isclose(gross, expected_gross, rel_tol=1e-9)
+
+
+def test_migration_adds_missing_columns_without_dropping_rows(tmp_path):
+    """Simulate a Droplet DB on V1's old schema. open_db must ALTER it forward
+    without losing the rows already captured. This is the migration path on
+    next code update — confirm it works on a representative pre-migration DB."""
+    import sqlite3
+    from avro.snapshot import open_db, row_count
+
+    db = tmp_path / "old.sqlite"
+    # Hand-craft the V1 schema (no reserves_json, emissions_raw, pool_fee).
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+      CREATE TABLE pool_epoch_snapshots (
+        captured_at INTEGER NOT NULL,
+        epoch_ts INTEGER NOT NULL,
+        pool_address TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        is_cl INTEGER NOT NULL,
+        is_stable INTEGER NOT NULL,
+        votes_raw TEXT NOT NULL,
+        gross_reward_usd REAL NOT NULL,
+        fees_json TEXT NOT NULL,
+        incentives_json TEXT NOT NULL,
+        PRIMARY KEY (captured_at, epoch_ts, pool_address)
+      );
+    """)
+    conn.execute("""INSERT INTO pool_epoch_snapshots VALUES
+      (1000, 2000, '0xold', 'OLD/PAIR', 0, 0, '12345', 1.5, '[]', '[]')""")
+    conn.commit()
+    conn.close()
+
+    # Open through avro's path — migration should fire.
+    with open_db(db) as conn:
+        assert row_count(conn) == 1
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pool_epoch_snapshots)")}
+        assert "reserves_json" in cols
+        assert "emissions_raw" in cols
+        assert "pool_fee" in cols
+        # Old row's defaults are present.
+        r = conn.execute(
+            "SELECT reserves_json, emissions_raw, pool_fee FROM pool_epoch_snapshots"
+        ).fetchone()
+        assert r == ("[]", "0", 0.0)
+
+    # Idempotent: running again must not blow up or duplicate columns.
+    with open_db(db) as conn:
+        assert row_count(conn) == 1
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pool_epoch_snapshots)")}
+        # No accidental duplicates from running migration twice.
+        assert sum(1 for c in cols if c == "reserves_json") == 1
 
 
 # ---------- allocation ----------

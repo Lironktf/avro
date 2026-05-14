@@ -41,9 +41,14 @@ class PoolSnapshot:
     votes_raw: int             # current veAERO weight on this pool, 18 decimals
     fees: List[RewardAmount] = field(default_factory=list)
     incentives: List[RewardAmount] = field(default_factory=list)
-    # Aggregate Aerodrome-side reserves USD per token in *this* pool. Used to
-    # build a per-token TVL map for haircut tiering. Keyed by token address.
-    reserves_usd_by_token: dict = field(default_factory=dict)
+    # Raw pool reserves (one entry per side). Lossless: keeps token addresses,
+    # raw amounts, and Sugar's price-at-capture-time so we can reprice or
+    # recompute strong-paired liquidity later under different policies.
+    reserves: List[RewardAmount] = field(default_factory=list)
+    # On-chain AERO emissions accrued to this pool this epoch (raw 18-decimal int).
+    emissions_raw: int = 0
+    # LP swap fee in basis-point-ish units as Sugar reports (e.g. 0.003 = 30 bps).
+    pool_fee: float = 0.0
 
     @property
     def votes_veaero(self) -> float:
@@ -53,6 +58,18 @@ class PoolSnapshot:
     @property
     def gross_reward_usd(self) -> float:
         return sum(r.usd_value for r in self.fees) + sum(r.usd_value for r in self.incentives)
+
+    @property
+    def reserves_usd_by_token(self) -> dict:
+        """Per-token USD reserves derived from `reserves`. Strong-paired liquidity
+        computation reads this. Kept as a property (not a stored field) so the
+        underlying raw data is always the source of truth."""
+        out: dict = {}
+        for r in self.reserves:
+            if r.usd_per_token <= 0:
+                continue
+            out[r.token_address] = out.get(r.token_address, 0.0) + r.usd_value
+        return out
 
 
 def _to_reward_amount(amt) -> RewardAmount:
@@ -67,17 +84,26 @@ def _to_reward_amount(amt) -> RewardAmount:
     )
 
 
-def _pool_reserves_usd(pool) -> dict:
-    """Compute USD value of each side of this pool's reserves, keyed by address."""
-    out: dict[str, float] = {}
+def _pool_reserves(pool) -> List[RewardAmount]:
+    """Capture both pool sides as RewardAmount records: token + raw amount + price.
+
+    Lossless — preserves enough to reprice with a different oracle later, or
+    recompute strong-paired liquidity under a different allowlist.
+    """
+    out: List[RewardAmount] = []
     for side in (pool.reserve0, pool.reserve1):
-        addr = side.token.token_address
-        decimals = side.token.decimals
-        price = float(getattr(side.price, "price", 0.0) or 0.0)
-        if price <= 0:
-            continue
-        human = side.amount / (10 ** decimals) if isinstance(side.amount, int) else float(side.amount)
-        out[addr] = out.get(addr, 0.0) + human * price
+        # `side.amount` is a float in Sugar's Amount; convert to raw int.
+        decimals = int(side.token.decimals)
+        amt = side.amount
+        amount_raw = int(round(float(amt) * (10 ** decimals))) if not isinstance(amt, int) else int(amt)
+        out.append(RewardAmount(
+            token_address=side.token.token_address,
+            symbol=side.token.symbol,
+            decimals=decimals,
+            amount_raw=amount_raw,
+            usd_per_token=float(getattr(side.price, "price", 0.0) or 0.0),
+            listed=bool(getattr(side.token, "listed", False)),
+        ))
     return out
 
 
@@ -109,7 +135,9 @@ def fetch_snapshots(chain: BaseChain) -> List[PoolSnapshot]:
                 votes_raw=int(ep.votes),
                 fees=[_to_reward_amount(a) for a in ep.fees],
                 incentives=[_to_reward_amount(a) for a in ep.incentives],
-                reserves_usd_by_token=_pool_reserves_usd(pool),
+                reserves=_pool_reserves(pool),
+                emissions_raw=int(getattr(ep, "emissions", 0) or 0),
+                pool_fee=float(getattr(pool, "pool_fee", 0.0) or 0.0),
             )
         )
     return snapshots
