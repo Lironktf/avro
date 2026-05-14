@@ -1,0 +1,825 @@
+The system would be:
+
+An automated veAERO vote optimizer that, once per week, waits until shortly before the voting cutoff, ranks all voteable pools by expected reward per unit of veAERO, computes the optimal allocation of your veAERO across pools, and submits the Voter.vote(...) transaction on-chain.
+
+I would spec it in two phases:
+
+MVP: automatically pick the best pool or top few pools each week and vote.
+Serious optimizer: forecast dilution, discount bad incentive tokens, model your own vote’s impact, claim rewards, and backtest decisions.
+1. What the algorithm is trying to maximize
+
+The goal is:
+
+maximize expected voting reward per epoch
+
+For each pool, your reward is approximately:
+
+Your payout=
+existing votes+your vote weight
+your vote weight
+	​
+
+×pool voting rewards
+
+Where:
+
+pool voting rewards=fees+incentives/bribes
+
+Aerodrome voting rewards are distributed to veAERO voters proportionally to the voting weight they contributed to a pool. The relevant rewards are the pool’s fee rewards and bribe/incentive rewards.
+
+2. The high-level weekly workflow
+Weekly cycle
+
+Aerodrome voting is weekly. Votes can be cast once per epoch, and normal NFTs cannot vote during the first hour or last hour of the epoch. The system should not hardcode times; it should read epochVoteEnd(...) directly from the Voter contract and vote shortly before that cutoff.
+
+Recommended schedule
+Time in week	What the bot does
+Thursday → Tuesday	Collect snapshots, observe how votes/rewards evolve
+Wednesday, repeatedly	Re-rank pools as the deadline approaches
+~30–45 min before non-whitelisted cutoff	Compute final allocation
+Immediately after	Submit Voter.vote(...)
+Following epoch / later	Claim fees and incentives when worth the gas
+
+The “wait until close to cutoff” idea is correct. Since the apparent vAPR changes as more rewards and more competing votes accumulate, voting later gives you a better estimate of realized reward-per-vote.
+
+3. What data it needs
+
+The algorithm needs, for every voteable pool:
+
+Pool identity
+pool address
+token pair symbol
+pool type: concentrated/basic, stable/volatile if relevant
+gauge address
+whether the gauge is alive
+Current voting/reward state
+current votes allocated to the pool
+current fee rewards
+current incentive/bribe rewards
+reward token addresses and amounts
+Price conversion
+USD price of each fee/incentive token
+AERO price, optionally, for displaying vAPR relative to veAERO value
+Your wallet state
+your veAERO NFT ID
+your current voting power
+whether you already voted this epoch
+whether the wallet is owner/approved for the NFT
+
+Sugar is the most natural official read layer here. The Velodrome/Aerodrome SDK docs explicitly say to use Sugar for data access, and Sugar exposes:
+
+all pools,
+latest pool epoch reward data,
+pool epoch histories,
+veNFT data,
+accrued voting rewards.
+4. Where it gets the current voting options from
+
+I would use this as the primary stack:
+
+Primary data source: Sugar / Sugar SDK
+Fetch all pools
+
+Use:
+
+LpSugar.all(...)
+or the Sugar SDK equivalent get_pools()
+
+The Lp struct includes:
+
+pool address,
+gauge address,
+whether the gauge is alive,
+bribe contract address,
+fee contract address,
+current epoch accrued fees,
+emissions,
+pool fee data.
+Fetch voting reward opportunities
+
+Use:
+
+RewardsSugar.epochsLatest(...)
+or Sugar SDK get_latest_pool_epochs()
+
+This gives, for each pool:
+
+epoch timestamp,
+current votes,
+emissions,
+fee reward token amounts,
+incentive/bribe token amounts.
+Fetch token prices
+
+Sugar SDK exposes get_prices(...), and its examples use that to price token data. For a serious optimizer, I would still add price sanity checks and optionally a secondary price source, because reward token pricing directly affects ranking.
+
+5. On-chain fallback / verification layer
+
+I would not rely only on Sugar. Before voting, the bot should verify the chosen pools on-chain through Aerodrome contracts.
+
+The Voter contract directly exposes or uses:
+
+gauges[pool]
+isAlive[gauge]
+weights[pool]
+maxVotingNum
+lastVoted[tokenId]
+vote(tokenId, pools, weights)
+
+This gives a clean architecture:
+
+Sugar for discovery and analytics.
+Direct contract calls for final validation and execution.
+
+6. How it compares different votes
+
+This is the core.
+
+For each pool i:
+
+R
+i
+	​
+
+ = total expected reward value in USD
+V
+i
+	​
+
+ = existing veAERO votes already pointed at the pool
+x
+i
+	​
+
+ = your veAERO allocation to that pool
+
+Your expected payout from that pool is:
+
+P
+i
+	​
+
+(x
+i
+	​
+
+)=R
+i
+	​
+
+×
+V
+i
+	​
+
++x
+i
+	​
+
+x
+i
+	​
+
+	​
+
+
+The algorithm chooses x
+i
+	​
+
+ across pools to maximize:
+
+i
+∑
+	​
+
+P
+i
+	​
+
+(x
+i
+	​
+
+)
+
+subject to:
+
+i
+∑
+	​
+
+x
+i
+	​
+
+=your total veAERO
+
+and:
+
+no more than maxVotingNum pools,
+only alive gauges,
+only eligible reward pools,
+optional exclusions for bad/restricted tokens.
+
+The contract itself normalizes the weight array you pass in. You supply relative weights; the Voter contract computes each pool’s actual veAERO weight as a proportional slice of your NFT’s current voting power.
+
+7. The simple scoring formula for MVP
+
+For your first version, I would calculate:
+
+raw reward-per-vote=
+current votes
+USD value of fees + incentives
+	​
+
+
+Then rank pools descending.
+
+This is basically the economic engine behind the “vAPR” column you see on the Aerodrome UI.
+
+Example
+
+Pool A:
+
+rewards = $100,000
+current votes = 10,000,000 veAERO
+0.01 USD per veAERO
+
+Pool B:
+
+rewards = $20,000
+current votes = 1,000,000 veAERO
+0.02 USD per veAERO
+
+Pool B is twice as attractive, even though it has fewer absolute rewards.
+
+8. But the algorithm should not just choose the highest displayed vAPR
+
+This matters.
+
+A displayed 300% vAPR can be misleading because:
+
+The incentive token may be illiquid or junk.
+Other voters may pile in before the deadline.
+The current vote count may be tiny, so a small influx crushes the APR.
+Your own vote can meaningfully dilute the pool if your veAERO size is large.
+The reward token may be volatile and hard to sell.
+
+So I would rank on a risk-adjusted expected reward, not UI vAPR.
+
+9. The serious ranking formula
+
+For each pool:
+
+Adjusted Reward Value=
+j
+∑
+	​
+
+(reward amount
+j
+	​
+
+×token price
+j
+	​
+
+×haircut
+j
+	​
+
+)
+
+Where the haircut reflects token quality:
+
+Reward token type	Example haircut
+USDC / WETH / cbBTC / strong liquid assets	95–100%
+AERO	90–100%, depending on whether you plan to hold
+mid-liquidity ecosystem tokens	60–90%
+low-liquidity / weird token	0–50%
+tokens you refuse to hold or cannot reasonably exit	0%
+
+Then:
+
+Adjusted score=
+Forecast Final Votes
+Adjusted Reward Value
+	​
+
+
+This is the score the bot should optimize, not raw rewards.
+
+10. Forecasting final vote dilution
+
+This is the most interesting part of the project.
+
+If you vote early, current votes are a poor denominator. Even if you vote late, a lot can shift in the final hours.
+
+So the bot should forecast:
+
+Final Votes=Current Votes+Expected Remaining Vote Inflow
+How to estimate this
+MVP
+
+Use a simple conservative multiplier:
+
+Forecast Final Votes=Current Votes×(1+d)
+
+Where d might be:
+
+5% for deep/high-vote pools close to cutoff,
+20–50% for sparse pools with volatile APR,
+much higher for fresh bribe pools that attract late snipers.
+Better version
+
+Build your own historical dataset.
+
+Every epoch, poll the vote page state:
+
+Thursday morning
+Friday
+Monday
+Tuesday
+Wednesday morning
+Wednesday final hour
+
+Store:
+
+reward value,
+votes,
+vAPR,
+pool category,
+eventual final votes.
+
+Then train a model or rule system to estimate:
+
+remaining vote inflow=f(current APR,pool type,reward token quality,time to deadline,historical behavior)
+
+Sugar exposes latest and historical epoch pool reward data, but for intra-epoch evolution you would likely need to collect and store your own snapshots over time.
+
+11. How it should allocate votes across pools
+
+There are three reasonable modes.
+
+Mode 1: Winner-take-all
+
+Send 100% of your vote to the top-ranked pool.
+
+Best when:
+
+your veAERO amount is small,
+the top pool is clearly better,
+you want simplicity.
+
+For 10 veAERO, this is almost certainly enough. Your vote has no practical market impact.
+
+Mode 2: Top-N equal or weighted split
+
+Example:
+
+60% to pool 1
+30% to pool 2
+10% to pool 3
+
+Useful when:
+
+top pools are close,
+you want diversification across reward tokens,
+you want to reduce “late dilution” risk.
+Mode 3: Marginal-return optimizer
+
+This is what I would build for the serious version.
+
+Your reward from a pool is:
+
+P
+i
+	​
+
+(x
+i
+	​
+
+)=R
+i
+	​
+
+⋅
+V
+i
+	​
+
++x
+i
+	​
+
+x
+i
+	​
+
+	​
+
+
+The marginal value of another small unit of veAERO declines as you allocate more to that pool.
+
+So the optimal strategy is not necessarily:
+
+all votes to the highest APR pool.
+
+Instead:
+
+allocate veAERO until the marginal reward across chosen pools is roughly equalized.
+
+For small voting power, this collapses to “pick the best pool.”
+For a large veAERO NFT, it becomes a real allocation problem.
+
+12. How it actually votes on-chain
+
+The bot sends a transaction to:
+
+Voter.vote(
+    uint256 tokenId,
+    address[] poolVote,
+    uint256[] weights
+)
+
+The Aerodrome Voter contract:
+
+checks that the sender owns or is approved for the veNFT,
+checks that this NFT has not already voted this epoch,
+checks that the number of selected pools is not above maxVotingNum,
+checks that each target gauge exists and is alive,
+calculates pool vote weights relative to the veNFT’s current voting power.
+Example
+
+If you want:
+
+70% Pool A
+30% Pool B
+
+You can submit:
+
+pools = [poolA, poolB]
+weights = [70, 30]
+
+The contract normalizes those into your actual current veAERO voting power.
+
+13. What wallet/signing setup is needed
+
+To be fully automatic, the system needs a signer that can submit the voting transaction.
+
+You have three realistic designs:
+
+A. Hot wallet owns the veAERO NFT
+
+Simplest technically.
+
+The bot holds a private key.
+That wallet owns the veAERO NFT.
+Bot submits votes directly.
+
+Downside: if the bot key is compromised, the veNFT is at risk.
+
+B. Your main wallet owns the veAERO NFT, bot is approved
+
+This depends on Aerodrome / ERC-721 approval semantics. The vote function only requires that the caller be owner or approved for the NFT, so in principle an approved executor wallet can vote. However, because ERC-721 approval may also allow NFT transfer depending on how approval is granted, this needs careful implementation and security review before use. The contract checks isApprovedOrOwner(...) for voting.
+
+C. Non-custodial recommendation bot
+
+The bot does everything except signing:
+
+ranks pools,
+creates calldata,
+shows “recommended vote,”
+you sign in wallet manually.
+
+This is safest and still very useful. For the first version, I would build this mode before autonomous signing.
+
+14. When exactly should it vote?
+Recommendation
+
+Vote once per week, around:
+
+30–45 minutes before epochVoteEnd
+
+Why not 2 minutes before?
+
+RPC congestion,
+gas estimation failure,
+wallet/signer hiccups,
+transaction replacement issues,
+Base sequencer issues,
+accidental missed cutoff.
+
+The contract exposes epochVoteEnd(timestamp), so the bot can calculate the correct cutoff from chain state rather than relying on a wall-clock constant.
+
+15. Should it monitor all week or only on Wednesday?
+It should do both.
+During the week
+
+Collect data snapshots every:
+
+6–12 hours early in the week,
+1 hour on Tuesday/Wednesday,
+5–15 minutes in the final 2–3 hours.
+
+This builds:
+
+a live ranking,
+a historical training set,
+better dilution forecasts.
+Voting
+
+Submit only once per week, because Aerodrome only lets a veNFT cast votes once per epoch.
+
+16. Should it claim rewards automatically?
+
+Yes, but that is a separate module.
+
+Aerodrome’s Voter contract exposes:
+
+claimBribes(...)
+claimFees(...)
+
+These claim the rewards owed to a veNFT from selected reward contracts.
+
+Claiming policy
+
+I would not necessarily claim every week. Instead:
+
+Claim when:
+
+claimable USD value>gas cost×safety multiple
+
+Example:
+
+if gas is $0.10 and claimable rewards are $0.30, maybe skip
+if claimable rewards are $10, claim
+
+Since Base gas is usually low, weekly claiming may be fine, but the system should still make it threshold-based.
+
+17. Full algorithm spec
+Input
+Base RPC endpoint
+Aerodrome contract addresses
+Sugar / Sugar SDK config
+veAERO NFT token ID
+signer mode:
+read-only recommender,
+approved executor,
+custodied hot wallet
+risk parameters:
+reward token whitelist / blacklist
+minimum liquidity / price confidence
+maximum pool count
+weighting strategy
+Step 1: Fetch candidate pools
+
+From Sugar:
+
+all pools,
+alive gauges,
+latest epoch rewards,
+latest votes.
+
+Remove:
+
+dead gauges,
+pools with no meaningful rewards,
+pools with unpriceable rewards,
+pools blocked by policy.
+Step 2: Value the rewards
+
+For each pool:
+
+price each fee reward token,
+price each incentive token,
+sum USD value,
+apply haircuts.
+
+Output:
+
+adjustedRewardUSD
+i
+	​
+
+Step 3: Forecast vote denominator
+
+For each pool:
+
+current votes V
+i
+	​
+
+expected additional late votes ΔV
+i
+	​
+
+forecastVotes
+i
+	​
+
+=V
+i
+	​
+
++ΔV
+i
+	​
+
+
+For MVP:
+
+ΔV
+i
+	​
+
+=V
+i
+	​
+
+×dilution buffer
+
+For later versions:
+
+learned from historical snapshot behavior.
+Step 4: Compute pool score
+score
+i
+	​
+
+=
+forecastVotes
+i
+	​
+
+adjustedRewardUSD
+i
+	​
+
+	​
+
+
+Also calculate:
+
+estimated APR,
+estimated weekly payout for your actual veAERO amount,
+reward token composition,
+confidence score.
+Step 5: Allocate votes
+
+Choose one of:
+
+winner-take-all,
+top-N weighted,
+marginal-return optimizer.
+
+For MVP, I would start with:
+
+100% to the top pool, unless the top two are within a small band, then split.
+
+Example rule:
+
+if Pool 1 score > Pool 2 score by 15%+, choose Pool 1 only
+otherwise split 60/40 or optimize exactly.
+Step 6: Preflight contract checks
+
+Before sending:
+
+fetch current veNFT voting power,
+verify signer is owner/approved,
+verify not already voted this epoch,
+verify selected gauges are alive,
+verify pool count <= maxVotingNum,
+verify before epochVoteEnd,
+simulate transaction.
+
+The Voter contract enforces these checks on-chain; the bot should check them off-chain first to avoid failed transactions.
+
+Step 7: Submit vote
+
+Call:
+
+vote(tokenId, poolAddresses, relativeWeights)
+
+Wait for confirmation.
+
+Persist:
+
+tx hash,
+pools,
+weights,
+data snapshot used,
+expected payout estimate,
+actual reward observed later.
+Step 8: Post-vote tracking
+
+After voting:
+
+track if your chosen pools get diluted further before cutoff,
+store actual end-of-epoch final votes,
+compare predicted vs realized,
+feed that into future forecast logic.
+Step 9: Claim rewards
+
+At appropriate time:
+
+fetch accrued bribes and fees for your veNFT,
+calculate total USD value,
+if threshold exceeded, submit claims.
+
+Sugar exposes veNFT-specific rewards, and the Voter contract provides the claim functions.
+
+18. What the dashboard should show
+
+I would build a small internal UI or CLI table like:
+
+Pool	Rewards $	Votes	Adjusted $/veAERO	Forecast dilution	Final score	Suggested %
+UP/cbBTC	62,079	3.66M	0.01697	-8%	0.01561	70%
+WETH/doginme	1,237	74.1k	0.01668	-18%	0.01368	30%
+AORA/USDC	261,388	144.1M	0.00181	-3%	0.00176	0%
+
+And then:
+
+Recommendation:
+Vote 70% UP/cbBTC, 30% WETH/doginme.
+
+Expected weekly reward:
+$0.16–$0.18 per 10 veAERO.
+
+Confidence:
+Medium. Pool 2 has higher late-vote dilution risk.
+19. What I would build first
+Version 0: Research notebook
+Pull current rewards/votes from Sugar
+Recreate the Aerodrome vote page rankings
+Compute reward-per-vote
+Verify against displayed vAPR ordering
+Version 1: Recommendation CLI
+python optimize_votes.py --venft-id 1234
+Outputs exact recommended pools + weights
+No signing
+Version 2: Transaction builder
+Produces calldata for Voter.vote(...)
+Simulates on Base fork or RPC simulation
+You sign manually
+Version 3: Fully automated signer
+Scheduled run every Wednesday
+Makes final decision
+Votes automatically
+Version 4: Claims + backtesting + adaptive model
+Claims voting rewards
+Tracks prediction error
+Learns dilution patterns
+Backtests alternative strategies
+20. Important risk controls
+
+The naive bot would chase fake APR. The good bot should have safeguards:
+
+Pool/reward quality filters
+ignore unpriceable incentive tokens
+cap exposure to exotic reward tokens
+optional allowlist only
+exclude pools where one token is clearly junk unless explicitly enabled
+Dilution risk
+penalize very small-vote pools with explosive APR
+penalize pools with historically high late vote inflow
+Data integrity
+compare Sugar data with direct on-chain contract state
+fail closed if pool/gauge mapping disagrees
+Execution risk
+never wait until the last few minutes
+transaction simulation required
+gas limit checks
+RPC failover
+Strategy risk
+do not assume screenshot vAPR is realized APR
+store actual outcomes and score accuracy over time
+21. My recommended exact product definition
+
+I would define the project as:
+
+Aerodrome veAERO Vote Optimizer
+A weekly automated strategy engine that identifies the highest expected risk-adjusted voting return on Aerodrome, allocates veAERO voting power across pools, and optionally submits the vote transaction before the weekly cutoff.
+
+Core features
+Fetch all Aerodrome voting opportunities.
+Price fees and incentives in USD.
+Compute reward-per-vote.
+Apply reward-token quality haircuts.
+Forecast late vote dilution.
+Optimize veAERO allocation.
+Generate or submit Voter.vote(...).
+Track realized outcomes.
+Claim fees/bribes when economical.
+Improve ranking with historical data.
+22. The central algorithmic insight
+
+The real problem is not “find the highest vAPR pool.”
+
+It is:
+
+Find the allocation that maximizes expected realized reward after accounting for vote dilution, reward token quality, and your own marginal impact on the denominator.
+
+That is a much more serious and worthwhile optimizer.
